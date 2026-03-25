@@ -16,168 +16,77 @@ The scripts load every `.pem` from a directory, assign each wallet to a shard vi
 
 ---
 
-## Managing wallets across shards
+## How the script works (implementation)
 
-- **Loading:** All PEMs in `--wallets-dir` are loaded and grouped into three lists: shard 0, shard 1, shard 2. Every command that uses wallets sees them already split by shard.
-- **Intra-shard:** For `transfer-intrashard` we only send between wallets in the **same** shard (receivers chosen at random within that shard). Relayers, when used, must also be in that shard.
-- **Cross-shard:** For `transfer-cross-shard` we send from wallets in a **source** shard to wallets in a **destination** shard. Relayers are taken from the **source** shard.
-- **All shards at once:** If you omit `--shard` in `transfer-intrashard`, the script runs **one thread per shard**. Shard 0, 1, and 2 are processed in parallel; within each shard, every wallet sends one batch of `--tx-per-wallet` transactions. That way we drive load on all three shards simultaneously from a single run.
+The driver we used in this repo is **`start.py`**: a continuous MultiversX transaction generator built on the SDK’s `ProxyNetworkProvider` and `TransfersController`. Conceptually it matches the behaviours described in the command reference below (funding, intra-shard, cross-shard, DEX, relayers); the concrete CLI uses **`--mode`** instead of separate subcommands.
 
-So “managing several wallets across shards” here means: one wallet dir, automatic shard assignment, and commands that either target one shard, or run all shards in parallel with one thread per shard.
+**Pipeline**
 
----
+1. **Load wallets** — Every `*.pem` under `--wallets-dir` becomes an `Account`; `AddressComputer` assigns each address to shard 0, 1, or 2.
+2. **Connect** — One gateway base URL is passed as **`--network`** (see [Two machines and gateways](#two-machines-and-gateways)). The script reads chain ID and, unless `--empty-nonces` is set, **fetches each account’s nonce** from the proxy (in parallel).
+3. **Build a ring** — Wallets are wired into a **ring topology** that depends on mode:
+   - **`normal` / `dex` / `relayed-dex`** — One global ring: wallet *i* sends to wallet *i*+1 (mod *n*).
+   - **`intra-shard`** — One independent sub-ring **per shard** (only same-shard hops).
+   - **`cross-shard` / `relayed-cross-shard`** — Wallets are **interleaved** round-robin across shards so each hop crosses to another shard where possible.
+   - **`wrap` / `unwrap`** — Each wallet targets its shard’s wrap contract.
+4. **Shard the work across cores** — Ring **nodes** are **partitioned round-robin** across **`--threads`** worker threads. Each worker only cycles its own subset of nodes (so multiple threads can touch different senders concurrently).
+5. **Send loop** — Each worker repeatedly walks its nodes. For each node it builds **up to 100 signed transactions** in one go (one batch), then calls **`send_transactions`** on the provider. There is no per-batch wait for finality in this path: throughput is limited by signing, HTTP, and gateway acceptance. Optional **`--limit`** stops after that many transactions have been reported sent; otherwise the run continues until Ctrl+C.
+6. **Relayed modes** — For `relayed-cross-shard` and `relayed-dex`, a **`--whale-pem`** wallet signs as the **relayer** (gas paid by the whale per relayed v2 rules).
 
-## Multicore logic
-
-We use Python’s `ThreadPoolExecutor` in two ways:
-
-1. **One thread per shard (when `--shard` is omitted in `transfer-intrashard`, or in `test-batches`)**  
-   Each shard that has wallets gets one worker. So with wallets in shards 0, 1, 2 we get three threads; each thread iterates over its shard’s wallets and sends one batch per wallet. No cross-shard locking: each thread only touches its own shard’s wallets and nonces.
-
-2. **N threads within a single shard (`--threads N` in `transfer-intrashard` when `--shard` is set)**  
-   We split the wallets of that shard into N chunks and assign each chunk to a worker. Each worker builds and sends batches for its wallets (one batch of `--tx-per-wallet` tx per wallet). So on a multi-core machine you can use e.g. `--threads 4` or `--threads 8` to send from many wallets in parallel inside one shard.
-
-Nonces are either fetched once from the network at the start or loaded from a file (`--nonces-file`). After that, each sender’s nonce is incremented in memory as we build transactions; we do not re-query the network between rounds when using `--loop`.
+So “the script” here is: **load → nonce sync → ring → N workers → batches of 100 tx** until stop. The tables in [Commands and parameters](#commands-and-parameters-reference) stay the human-readable map of *what* we wanted to do; **`start.py`** is the ring-based engine we actually ran for sustained load.
 
 ---
 
-## Loop and batch behaviour (how it was used)
+## Two machines and gateways
 
-- **Fund:** One transfer per wallet from the whale. Tx are sent in batches of 100; we wait for the last tx of each batch to complete before sending the next batch.
-- **Intra-shard (one shard):** One “round” = each wallet sends one batch of `--tx-per-wallet` tx (default 100). With `--loop`, we repeat rounds with a delay `--round-delay-ms` (default 600 ms, applied after the round time). Multicore: `--threads` splits wallets across workers.
-- **Intra-shard (all shards):** Same idea, but one thread per shard; each shard runs its own “every wallet sends one batch” round. With `--loop`, all shards sleep together then run the next round.
-- **Cross-shard:** One shot: each source-shard wallet sends 99 tx to random destination-shard wallets. All tx are built then sent in batches of 1000 (no wait between batches).
-- **test-batches:** One batch per wallet across all shards; shards run in parallel (one thread per shard). Used to sanity-check that we can send one batch from every wallet on all shards.
-- **test-swap:** One wrap, then swap tx in batches of 100, waiting for the last tx of each batch before the next. Single wallet.
+We ran the workload from **two different computers** to split CPU and outbound connections. Each machine had its own checkout, venv, and a **disjoint subset** of the wallet PEMs — we **split wallets across machines** so each address was only ever driven by one host. The script has **no built-in coordination** between hosts; sharing the same PEMs on two boxes would risk **nonce clashes** (two in-memory sequences for one on-chain account). Splitting the set avoids that.
 
----
+**Kepler vs public gateway**
 
-## Setup
-
-```sh
-python3 -m venv ./venv
-source ./venv/bin/activate
-pip install -r ./requirements.txt --upgrade
-```
+The script takes a **single** `--network` URL. We used the **Kepler gateway** as the primary endpoint for lower latency and competition-specific routing. When Kepler was **slow, erroring, or rate-limiting**, we **restarted** the process with the **public MultiversX gateway** URL as `--network`. There is **no automatic failover** in code: recovery is **operational** (restart or shell wrapper that probes Kepler and switches URL). Both endpoints speak the same proxy API; only the base URL changes.
 
 ---
 
-## Commands and parameters (reference)
+## Nonces, gateway rejects, and automatic recovery
 
-### `create-wallets`
+**Why nonces go out of sync**
 
-Create N wallets once; no loop, no shards.
+Each sender’s next nonce must match what the **chain** expects. The script keeps a **single in-memory nonce per `Account`**, advanced when building transactions. Parallel workers use **one lock per sender address** so two threads never reserve the same nonce for the same wallet. If the **gateway accepts only part** of a batch, or **rejects** transactions (wrong nonce, low gas, temporary errors), the in-memory counter can drift ahead of reality until corrected.
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory to save PEM files (created if missing) |
-| `--number-of-wallets` | yes | — | Number of wallets to create |
+**What happens on send**
 
----
+- Transactions are built with **`get_nonce_then_increment()`** so nonces are reserved sequentially inside the lock.
+- **`send_transactions`** returns how many transactions were actually accepted (`num_sent`) and may return fewer than the batch size if the gateway drops some.
+- **Partial acceptance:** For each **missing** acceptance, the code **decrements** the account nonce by that count so the next batch retries the **skipped** nonces.
+- **Total failure** (exception path): the whole batch is rolled back by decrementing by the batch length.
+- **Signing/build errors** for a single tx: decrement by one for that attempt.
 
-### `fund`
+So “refused by the gateway” shows up as **partial or zero `num_sent`**; the client **rolls back** the unused nonces immediately.
 
-One pass: one EGLD transfer per loaded wallet from the whale. Batches of 100; wait for last tx of batch before next batch.
+**Automatic recovery when things go badly wrong**
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory containing wallet PEM files |
-| `--whale` | yes | — | Path to whale PEM |
-| `--network` | yes | — | Network URL |
-| `--amount` | no | all balance | Total to distribute (atomic units) |
-| `--gas-price` | no | network | Gas price in atomic units |
+If **at least ~75%** of the last batch **failed** to send (gateway saturation, persistent bad nonce, etc.), the wallet is **suspended** for that worker: the ring **skips** it until recovery. A background **`_nonce_watcher`** thread polls the account on the proxy about every **2 seconds**. When the **on-chain nonce** has **caught up** to what we consider the baseline **and** balance is still enough for gas, the wallet is **resumed**. If balance is too low, the watcher logs a **low balance** state and the wallet can stay suspended. This avoids hammering the gateway with impossible nonces while the chain or another client advances the account.
 
----
+**Fresh start from the network**
 
-### `transfer-intrashard`
+On startup, **`initialize_nonces`** pulls current nonces from the proxy (unless **`--empty-nonces`**, which forces 0 for special cases). There is no continuous nonce sync during steady state except the suspension path above.
 
-Intra-shard transfers; multicore via `--threads` (single shard) or one thread per shard (omit `--shard`). Optional `--loop` with `--round-delay-ms`.
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory containing wallet PEM files |
-| `--network` | yes | — | Network URL |
-| `--shard` | no | all | Shard (0, 1, or 2). Omit to run all shards in parallel |
-| `--amount` | yes | — | Amount per transaction (atomic units) |
-| `--relayer` | no | — | Relayer address (same shard). Mutually exclusive with `--random-relayer` |
-| `--random-relayer` | no | false | Use a random relayer from same shard per tx |
-| `--loop` | no | false | Run rounds until Ctrl+C |
-| `--threads` | no | 1 | Worker threads (single-shard mode) |
-| `--round-delay-ms` | no | 600 | Delay (ms) between rounds when `--loop` |
-| `--tx-per-wallet` | no | 100 | Transactions per wallet per round |
-| `--nonces-file` | no | — | Load nonces from JSON/CSV (from `fetch-nonces`) |
-| `--gas-price` | no | network | Gas price in atomic units |
+Together, this gives **per-batch rollback**, **per-wallet suspension** under heavy failure, and **reconciliation** via polling before resuming.
 
 ---
 
-### `transfer-cross-shard`
+## Dynamic gas price (not needed for this challenge)
 
-One shot: 99 tx per source wallet to random destination-shard wallets. Batches of 1000, no wait between batches.
+The network exposes **dynamic minimum gas price** (and related parameters) via the proxy’s network config. For **native transfers** in `start.py`, gas price is set to a **fixed** value (`1_100_000_000` in atomic units in the current code path), not re-read on every batch.
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory containing wallet PEM files |
-| `--network` | yes | — | Network URL |
-| `--source-shard` | yes | — | 0, 1, or 2 |
-| `--destination-shard` | yes | — | 0, 1, or 2 (must differ from source) |
-| `--amount` | yes | — | Amount per transaction (atomic units) |
-| `--relayer` | no | — | Relayer from source shard. Mutually exclusive with `--random-relayer` |
-| `--random-relayer` | no | false | Random relayer from source shard per tx |
-| `--gas-price` | no | network | Gas price in atomic units |
+During the Battle of Nodes run, **fixed gas was enough**: congestion did not force us to chase a moving floor or outbid other senders for inclusion. If we had needed it, sensible optimisations would have been:
+
+- Periodically refresh **`min_gas_price`** (or a small multiple) from **`get_network_config`** and use that for new transactions.
+- On **systematic gateway rejection** or **“gas price too low”** style errors, **bump** gas price and **retry** the same nonces (after rollback).
+- Optionally track **recent inclusion** or proxy hints, if available, to avoid overpaying while staying above the floor.
+- For **DEX / SC** paths, align with whatever the `TransfersController` / SC factory uses by default and apply the same refresh strategy.
+
+None of that was implemented for this challenge because the fixed setting remained viable end-to-end.
 
 ---
 
-### `fetch-nonces`
-
-Fetch current nonce for every loaded wallet; write to JSON or CSV. No loop.
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory containing wallet PEM files |
-| `--network` | yes | — | Network URL |
-| `--output` | yes | — | Output path (`.json` or `.csv`) |
-
----
-
-### `test-batches`
-
-One batch per wallet on all shards; shards in parallel (one thread per shard).
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallets-dir` | yes | — | Directory containing wallet PEM files |
-| `--network` | yes | — | Network URL |
-| `--amount` | yes | — | Amount per transaction (atomic units) |
-| `--tx-per-wallet` | no | 100 | Transactions per wallet in the single batch |
-| `--nonces-file` | no | — | Load nonces from JSON/CSV instead of network |
-| `--gas-price` | no | network | Gas price in atomic units |
-
----
-
-### `test-swap`
-
-One wrap, then swap tx in batches of 100; wait for last tx of each batch. Single wallet.
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--wallet` | yes | — | Path to wallet PEM |
-| `--amount` | yes | — | WEGLD per swap (atomic units) |
-| `--number-of-swaps` | no | 1 | Number of WEGLD→USDC swaps |
-| `--network` | yes | — | Network URL |
-| `--min-amount-out` | no | 1 | Minimum USDC per swap (slippage) |
-| `--relayer` | no | — | Relayer (same shard). Mutually exclusive with `--random-relayer` |
-| `--random-relayer` | no | false | Random relayer per tx |
-
----
-
-## Summary: batch and round behaviour
-
-| Command | Batch size (send) | Waits between batches? | Rounds / loop |
-|---------|--------------------|-------------------------|---------------|
-| `fund` | 100 | Yes (last tx of batch) | 1 |
-| `transfer-intrashard` | 1 batch per wallet (`tx-per-wallet` tx) | No | 1 or `--loop` |
-| `transfer-cross-shard` | 1000 | No | 1 (99 tx per wallet) |
-| `test-batches` | 1 batch per wallet (`tx-per-wallet` tx) | No | 1, shards in parallel |
-| `test-swap` | 100 (swaps only) | Yes (last tx of batch) | 1 wrap + 1 swap phase |
-
-Amounts are in atomic units (1 EGLD = 10^18). Relayers must be in the sender’s shard (source shard for cross-shard).

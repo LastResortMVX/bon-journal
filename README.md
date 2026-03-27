@@ -1,92 +1,69 @@
-# BON Journal
-
-Notes on how these scripts were used to manage many wallets across shards, with multicore logic for intra-shard and cross-shard traffic.
+# BON Journal — Challenge 4
 
 ---
 
 ## What we were doing
 
-We had a set of PEM wallets spread across shards 0, 1, and 2. The goal was to:
+We extended the workload beyond plain transfers and DEX rings:
 
-- **Fund** all of them from a single whale.
-- **Generate load** per shard (intra-shard transfers) and **between** shards (cross-shard transfers), with optional **relayers**.
-- Use **multiple CPU cores** so we could send from many wallets in parallel without blocking on a single thread.
+- **`forwarder-cross-shard` + `--use-forwarder-relayers`** — This is where the **three distinct relayer wallets (one per shard)** live in `start.py`: constants **`RELAYER_0`**, **`RELAYER_1`**, **`RELAYER_2`**. PEMs for those addresses must sit under **`--wallets-dir`**; the loader maps bech32 → `Account` and fills **`ForwarderConfig.relayers_by_shard`**. In **`worker_thread`**, each tx uses **`shard_relayer = relayers_by_shard.get(node.shard)`**: senders on shard 0/1/2 get the relayer for that shard only. **`kwargs["relayer"]`** and **`sign_as_relayer(tx, shard_relayer, …)`** use that account — not the ring wallets, not **`--whale-pem`**.
+- **`forwarder-cross-shard`** (contract calls) — Each ring node calls its **shard’s forwarder contract** (`ForwarderConfig.contracts_by_shard[node.shard]`). Endpoints mix **blind** functions per shard; swap schedule is **50/50 WEGLD↔USDC** per batch plan (shuffled). Relayers are optional; without **`--use-forwarder-relayers`**, those relayer lines are skipped.
+- **`relayed-cross-shard` / `relayed-dex`** — **Different relayer model in code**: a **single** account loaded from **`--whale-pem`** (`whale_account` in the source). **`relayer_addr`** is always **`whale_account.address`** for every tx; **`sign_as_relayer(tx, whale_account, …)`** runs for all relayed sends. There is **no** shard-indexed relayer map in these modes — only the forwarder path uses the three per-shard keys above.
 
-The scripts load every `.pem` from a directory, assign each wallet to a shard via the address (MultiversX SDK `AddressComputer`), then run commands that respect shard boundaries and optional relayer/sender logic.
-
----
-
-## How the script works (implementation)
-
-The driver we used in this repo is **`start.py`**: a continuous MultiversX transaction generator built on the SDK’s `ProxyNetworkProvider` and `TransfersController`. Conceptually it matches the behaviours described in the command reference below (funding, intra-shard, cross-shard, DEX, relayers); the concrete CLI uses **`--mode`** instead of separate subcommands.
-
-**Pipeline**
-
-1. **Load wallets** — Every `*.pem` under `--wallets-dir` becomes an `Account`; `AddressComputer` assigns each address to shard 0, 1, or 2.
-2. **Connect** — One gateway base URL is passed as **`--network`** (see [Two machines and gateways](#two-machines-and-gateways)). The script reads chain ID and, unless `--empty-nonces` is set, **fetches each account’s nonce** from the proxy (in parallel).
-3. **Build a ring** — Wallets are wired into a **ring topology** that depends on mode:
-   - **`normal` / `dex` / `relayed-dex`** — One global ring: wallet *i* sends to wallet *i*+1 (mod *n*).
-   - **`intra-shard`** — One independent sub-ring **per shard** (only same-shard hops).
-   - **`cross-shard` / `relayed-cross-shard`** — Wallets are **interleaved** round-robin across shards so each hop crosses to another shard where possible.
-   - **`wrap` / `unwrap`** — Each wallet targets its shard’s wrap contract.
-4. **Shard the work across cores** — Ring **nodes** are **partitioned round-robin** across **`--threads`** worker threads. Each worker only cycles its own subset of nodes (so multiple threads can touch different senders concurrently).
-5. **Send loop** — Each worker repeatedly walks its nodes. For each node it builds **up to 100 signed transactions** in one go (one batch), then calls **`send_transactions`** on the provider. There is no per-batch wait for finality in this path: throughput is limited by signing, HTTP, and gateway acceptance. Optional **`--limit`** stops after that many transactions have been reported sent; otherwise the run continues until Ctrl+C.
-6. **Relayed modes** — For `relayed-cross-shard` and `relayed-dex`, a **`--whale-pem`** wallet signs as the **relayer** (gas paid by the whale per relayed v2 rules).
-
-So “the script” here is: **load → nonce sync → ring → N workers → batches of 100 tx** until stop. The tables in [Commands and parameters](#commands-and-parameters-reference) stay the human-readable map of *what* we wanted to do; **`start.py`** is the ring-based engine we actually ran for sustained load.
+The common engine is unchanged in spirit: **load PEMs → shard via `AddressComputer` → build a ring → partition across `--threads` → batches of up to 100 signed txs → `send_transactions`**, with nonce locks, partial-send rollback, and the suspension / nonce watcher when failure rates spike.
 
 ---
 
-## Two machines and gateways
+## How the script wires relayed vs forwarder logic
 
-We ran the workload from **two different computers** to split CPU and outbound connections. Each machine had its own checkout, venv, and a **disjoint subset** of the wallet PEMs — we **split wallets across machines** so each address was only ever driven by one host. The script has **no built-in coordination** between hosts; sharing the same PEMs on two boxes would risk **nonce clashes** (two in-memory sequences for one on-chain account). Splitting the set avoids that.
+**Ring topology (`build_ring`)**
 
-**Kepler vs public gateway**
+- **`forwarder-cross-shard`** uses the **same global ring** as `normal` / `dex` / `relayed-dex`: wallet *i* → wallet *i*+1. The “destination” in the node is still the next wallet; **forwarder mode ignores that for the SC path** and instead targets **`ForwarderConfig.contracts_by_shard[node.shard]`**.
+- **`relayed-cross-shard`** keeps the **interleaved cross-shard ring** (like `cross-shard`). Relayer v2 uses **one** **`whale_account`** from **`--whale-pem`** for every transaction (no per-shard switch).
 
-The script takes a **single** `--network` URL. We used the **Kepler gateway** as the primary endpoint for lower latency and competition-specific routing. When Kepler was **slow, erroring, or rate-limiting**, we **restarted** the process with the **public MultiversX gateway** URL as `--network`. There is **no automatic failover** in code: recovery is **operational** (restart or shell wrapper that probes Kepler and switches URL). Both endpoints speak the same proxy API; only the base URL changes.
+**Relayed v2 (`--whale-pem` — single relayer for all shards)**
 
----
+For `relayed-cross-shard` and `relayed-dex`, after building each transaction, **`sign_as_relayer(tx, whale_account, transaction_computer)`** runs. Native and DEX builds pass **`relayer=whale_account.address`**.
 
-## Nonces, gateway rejects, and automatic recovery
+**Forwarder path (shard contracts + three shard relayers when enabled)**
 
-**Why nonces go out of sync**
+`ForwarderConfig` holds, per shard: **forwarder contract address**, **owner** (drain / ops), **`relayers_by_shard`** (populated from **`RELAYER_0` / `RELAYER_1` / `RELAYER_2`** when **`use_relayers`**), plus gas limits and swap parameters.
 
-Each sender’s next nonce must match what the **chain** expects. The script keeps a **single in-memory nonce per `Account`**, advanced when building transactions. Parallel workers use **one lock per sender address** so two threads never reserve the same nonce for the same wallet. If the **gateway accepts only part** of a batch, or **rejects** transactions (wrong nonce, low gas, temporary errors), the in-memory counter can drift ahead of reality until corrected.
+Per transaction in **`worker_thread`** (forwarder branch):
 
-**What happens on send**
+1. Pick **`endpoint`** from a per-shard **function plan** (e.g. shard 1 uses 100× `blindSync`; other shards mix `blindAsyncV1`, `blindAsyncV2`, `blindTransfExec`) and **`token_in` / `token_out` / `amount_in`** from the **100-slot swap plan** (50 WEGLD→USDC, 50 USDC→WEGLD), both **shuffled** per batch for variety.
+2. Build **`function_call_parts`** for the inner DEX call (`swapTokensFixedInput` + token out + min out as raw byte buffers).
+3. **`create_transaction_for_execute`** on the **shard forwarder** with arguments **`[exchange_contract, function_call_parts]`** and **`token_transfers`** of the chosen token/amount; **`gas_limit`** is the large forwarder budget (`FORWARDER_GAS_LIMIT`).
+4. If **`use_relayers`**, **`shard_relayer = relayers_by_shard.get(node.shard)`** — attach **`relayer=shard_relayer.address`** and **`sign_as_relayer(tx, shard_relayer, …)`**. Forwarder mode is **not** in **`RELAYED_MODES`**, so **`whale_account`** is never used here.
 
-- Transactions are built with **`get_nonce_then_increment()`** so nonces are reserved sequentially inside the lock.
-- **`send_transactions`** returns how many transactions were actually accepted (`num_sent`) and may return fewer than the batch size if the gateway drops some.
-- **Partial acceptance:** For each **missing** acceptance, the code **decrements** the account nonce by that count so the next batch retries the **skipped** nonces.
-- **Total failure** (exception path): the whole batch is rolled back by decrementing by the batch length.
-- **Signing/build errors** for a single tx: decrement by one for that attempt.
+**Drain / redistribute (optional in code)**
 
-So “refused by the gateway” shows up as **partial or zero `num_sent`**; the client **rolls back** the unused nonces immediately.
-
-**Automatic recovery when things go badly wrong**
-
-If **at least ~75%** of the last batch **failed** to send (gateway saturation, persistent bad nonce, etc.), the wallet is **suspended** for that worker: the ring **skips** it until recovery. A background **`_nonce_watcher`** thread polls the account on the proxy about every **2 seconds**. When the **on-chain nonce** has **caught up** to what we consider the baseline **and** balance is still enough for gas, the wallet is **resumed**. If balance is too low, the watcher logs a **low balance** state and the wallet can stay suspended. This avoids hammering the gateway with impossible nonces while the chain or another client advances the account.
-
-**Fresh start from the network**
-
-On startup, **`initialize_nonces`** pulls current nonces from the proxy (unless **`--empty-nonces`**, which forces 0 for special cases). There is no continuous nonce sync during steady state except the suspension path above.
-
-Together, this gives **per-batch rollback**, **per-wallet suspension** under heavy failure, and **reconciliation** via polling before resuming.
+There is a **`forwarder_drain_thread`** / **`_drain_and_redistribute_shard`** design (owner calls **`drain`** on the forwarder, then redistributes ESDT to shard wallets). In the current tree it may be commented out at startup; operationally it matters for keeping forwarder liquidity balanced across long runs.
 
 ---
 
-## Dynamic gas price (not needed for this challenge)
+## Gas price: what failed us today
 
-The network exposes **dynamic minimum gas price** (and related parameters) via the proxy’s network config. For **native transfers** in `start.py`, gas price is set to a **fixed** value (`1_100_000_000` in atomic units in the current code path), not re-read on every batch.
+The script still uses a **single compile-time `GAS_PRICE`** for built transactions (native, wrap/unwrap, SC executes). It does **not** periodically refresh **`min_gas_price`** from **`get_network_config`**, and it does **not** bump price on systematic “gas too low” or gateway rejections beyond the existing nonce rollback / suspension behaviour.
 
-During the Battle of Nodes run, **fixed gas was enough**: congestion did not force us to chase a moving floor or outbid other senders for inclusion. If we had needed it, sensible optimisations would have been:
+**What failed us today was not the ring or relayer wiring — it was the lack of planning around gas price evolution.** As the network floor or competition moved, a fixed price turned into silent friction: partial accepts, rejections, and wasted batches while we treated the symptom (nonces, gateway load) instead of **tracking and adapting to a moving minimum**.
 
-- Periodically refresh **`min_gas_price`** (or a small multiple) from **`get_network_config`** and use that for new transactions.
-- On **systematic gateway rejection** or **“gas price too low”** style errors, **bump** gas price and **retry** the same nonces (after rollback).
-- Optionally track **recent inclusion** or proxy hints, if available, to avoid overpaying while staying above the floor.
-- For **DEX / SC** paths, align with whatever the `TransfersController` / SC factory uses by default and apply the same refresh strategy.
+For a future run, the operational minimum would be:
 
-None of that was implemented for this challenge because the fixed setting remained viable end-to-end.
+- Refresh **network min gas price** (or a safe multiple) on an interval or before large batches, and feed that into **`gas_price`** for new transactions.
+- On **persistent** low-acceptance or explicit low-gas errors, **raise** price and **retry** after rollback, without assuming yesterday’s constant still clears the mempool today.
+- Revisit **cost estimates** (`_gas_price_per_tx`, **`--whale-pem`** balance for relayed modes, **`RELAYER_0/1/2`** balances for forwarder+relayers) whenever `GAS_PRICE` or limits change — relayed and forwarder paths multiply small price deltas by **very large gas limits**.
 
 ---
 
+## Quick command map (this repo)
+
+| Intent | Mode / flags |
+|--------|----------------|
+| Cross-shard ring, **one** relayer (all shards) pays gas | `--mode relayed-cross-shard --whale-pem <single-relayer.pem>` |
+| DEX ring, **one** relayer pays gas | `--mode relayed-dex --whale-pem <single-relayer.pem>` |
+| Forwarder + **three** relayers (shard 0/1/2) | `--mode forwarder-cross-shard --abi ./forwarder-blind-bon.abi.json --use-forwarder-relayers` — PEMs for **`RELAYER_0`**, **`RELAYER_1`**, **`RELAYER_2`** in **`--wallets-dir`** |
+
+Forwarder contract addresses, owner addresses, and **`RELAYER_*`** bech32 values are **constants in `start.py`** (`RELAYER_0` … `RELAYER_2`); those three PEMs must be present in **`--wallets-dir`** when **`--use-forwarder-relayers`** is set.
+
+---
